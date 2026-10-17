@@ -422,3 +422,19 @@
   min-height: 23px;
   font-size: 0.82em;
 }
+
+.logos-help-section {
+  clear: both;
+  margin-top: 24px;
+  padding-top: 16px;
+  border-top: 1px solid var(--background-modifier-border);
+}
+
+.logos-help-section h3 {
+  margin: 0 0 12px;
+}
+
+.logos-help-section .logos-help-button {
+  display: block;
+  margin: 0;
+}
