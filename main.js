@@ -37,7 +37,7 @@ var import_child_process = require("child_process");
 var path = __toESM(require("path"), 1);
 var fs = __toESM(require("fs"), 1);
 
-// node_modules/@breezystack/lamejs/dist/lamejs.js
+// ../Logos/node_modules/@breezystack/lamejs/dist/lamejs.js
 var fa = {};
 function Xa(w) {
   return new Int8Array(w);
@@ -11192,6 +11192,10 @@ var LogosPlayerView = class extends import_obsidian.ItemView {
       }
     };
     previewButton.onclick = async () => {
+      if (this.plugin.isGeneratingSpeech()) {
+        new import_obsidian.Notice("Generating, please wait");
+        return;
+      }
       statusEl.setText(
         "Generating voice preview..."
       );
@@ -11201,6 +11205,10 @@ var LogosPlayerView = class extends import_obsidian.ItemView {
       );
     };
     nextVoiceButton.onclick = async () => {
+      if (this.plugin.isGeneratingSpeech()) {
+        new import_obsidian.Notice("Generating, please wait");
+        return;
+      }
       const options = Array.from(
         voiceSelect.options
       );
@@ -11438,8 +11446,6 @@ var LogosPlugin = class extends import_obsidian.Plugin {
     this.playbackGeneration = 0;
     this.activeTtsChild = null;
     this.ttsRequestId = 0;
-    this.ttsStdoutBuffer = "";
-    this.ttsStderrBuffer = "";
     this.pendingTtsRequests = /* @__PURE__ */ new Map();
     this.chunkPlaybackResolver = null;
     this.currentSpeechChunkFiles = [];
@@ -13321,6 +13327,9 @@ ${pdfText}
           chunks[index + 1],
           index + 1,
           generation
+        ).then(
+          (outputPath) => ({ ok: true, outputPath }),
+          (error) => ({ ok: false, error })
         ) : null;
         const played = await this.playSpeechChunk(
           currentPath,
@@ -13333,7 +13342,9 @@ ${pdfText}
           return false;
         }
         if (nextPromise) {
-          currentPath = await nextPromise;
+          const next = await nextPromise;
+          if (!next.ok) throw next.error;
+          currentPath = next.outputPath;
           if (!currentPath) {
             return false;
           }
@@ -13374,22 +13385,23 @@ ${pdfText}
       text
     );
   }
-  rejectPendingTtsRequests(message) {
+  isGeneratingSpeech() {
+    return this.pendingTtsRequests.size > 0;
+  }
+  rejectPendingTtsRequests(child, message) {
     const error = new Error(message);
-    for (const pending of this.pendingTtsRequests.values()) {
-      pending.reject(error);
+    for (const [id, pending] of this.pendingTtsRequests) {
+      if (pending.child === child) {
+        this.pendingTtsRequests.delete(id);
+        pending.reject(error);
+      }
     }
-    this.pendingTtsRequests.clear();
   }
   destroyPersistentTtsWorker(reason = "TTS worker stopped.") {
     const child = this.activeTtsChild;
     this.activeTtsChild = null;
-    this.ttsStdoutBuffer = "";
-    this.ttsStderrBuffer = "";
-    this.rejectPendingTtsRequests(
-      reason
-    );
     if (child) {
+      this.rejectPendingTtsRequests(child, reason);
       try {
         child.kill();
       } catch (error) {
@@ -13401,7 +13413,7 @@ ${pdfText}
     }
   }
   ensurePersistentTtsWorker(pluginPath, nodePath, workerPath) {
-    if (this.activeTtsChild && this.activeTtsChild.exitCode === null && !this.activeTtsChild.killed) {
+    if (this.activeTtsChild && this.activeTtsChild.exitCode === null && !this.activeTtsChild.killed && this.activeTtsChild.signalCode === null && !this.activeTtsChild.stdin.destroyed && this.activeTtsChild.stdin.writable) {
       return this.activeTtsChild;
     }
     const child = (0, import_child_process.spawn)(
@@ -13416,22 +13428,23 @@ ${pdfText}
       }
     );
     this.activeTtsChild = child;
-    this.ttsStdoutBuffer = "";
-    this.ttsStderrBuffer = "";
+    let stdoutBuffer = "";
+    let stderrBuffer = "";
     child.stdout.on(
       "data",
       (data) => {
-        this.ttsStdoutBuffer += data.toString();
+        if (this.activeTtsChild !== child) return;
+        stdoutBuffer += data.toString();
         while (true) {
-          const newlineIndex = this.ttsStdoutBuffer.indexOf("\n");
+          const newlineIndex = stdoutBuffer.indexOf("\n");
           if (newlineIndex === -1) {
             break;
           }
-          const line = this.ttsStdoutBuffer.slice(
+          const line = stdoutBuffer.slice(
             0,
             newlineIndex
           ).trim();
-          this.ttsStdoutBuffer = this.ttsStdoutBuffer.slice(
+          stdoutBuffer = stdoutBuffer.slice(
             newlineIndex + 1
           );
           if (!line) {
@@ -13441,7 +13454,7 @@ ${pdfText}
             const result = JSON.parse(line);
             const id = Number(result.id);
             const pending = this.pendingTtsRequests.get(id);
-            if (!pending) {
+            if (!pending || pending.child !== child) {
               console.warn(
                 "Logos: Received TTS response for unknown request:",
                 result
@@ -13473,8 +13486,9 @@ ${pdfText}
     child.stderr.on(
       "data",
       (data) => {
+        if (this.activeTtsChild !== child) return;
         const message = data.toString();
-        this.ttsStderrBuffer += message;
+        stderrBuffer += message;
         const trimmed = message.trim();
         if (trimmed) {
           console.warn(
@@ -13484,46 +13498,42 @@ ${pdfText}
         }
       }
     );
-    child.on(
-      "error",
-      (error) => {
-        if (this.activeTtsChild === child) {
-          this.activeTtsChild = null;
-        }
-        console.error(
-          "Logos persistent TTS process error:",
-          error
-        );
-        this.rejectPendingTtsRequests(
-          error.message
-        );
+    const onError = (error) => {
+      if (this.activeTtsChild === child) {
+        console.error("Logos persistent TTS process error:", error);
+        this.destroyPersistentTtsWorker(error.message);
+      } else {
+        this.rejectPendingTtsRequests(child, error.message);
       }
-    );
-    child.on(
-      "close",
-      (code, signal) => {
-        if (this.activeTtsChild === child) {
-          this.activeTtsChild = null;
-        }
-        if (this.pendingTtsRequests.size > 0) {
-          const details = this.ttsStderrBuffer.trim();
-          this.rejectPendingTtsRequests(
-            details || `TTS worker exited with code ${code}, signal ${signal}.`
-          );
-        }
-        this.ttsStdoutBuffer = "";
-        this.ttsStderrBuffer = "";
+    };
+    child.on("error", onError);
+    child.stdin.on("error", onError);
+    child.on("close", (code, signal) => {
+      if (this.activeTtsChild === child) {
+        this.activeTtsChild = null;
       }
-    );
+      this.rejectPendingTtsRequests(
+        child,
+        stderrBuffer.trim() || `TTS worker exited with code ${code}, signal ${signal}.`
+      );
+    });
     return child;
   }
   sendPersistentTtsRequest(child, request) {
     const id = ++this.ttsRequestId;
     return new Promise(
       (resolve, reject) => {
+        if (this.activeTtsChild !== child || child.killed || child.exitCode !== null || child.signalCode !== null || child.stdin.destroyed || !child.stdin.writable) {
+          reject(new Error("TTS worker is not available."));
+          return;
+        }
+        const rejectRequest = (error) => {
+          if (this.pendingTtsRequests.delete(id)) reject(error);
+        };
         this.pendingTtsRequests.set(
           id,
           {
+            child,
             resolve,
             reject
           }
@@ -13534,11 +13544,13 @@ ${pdfText}
               id,
               action: "synthesize",
               ...request
-            }) + "\n"
+            }) + "\n",
+            (error) => {
+              if (error) rejectRequest(error);
+            }
           );
         } catch (error) {
-          this.pendingTtsRequests.delete(id);
-          reject(
+          rejectRequest(
             error instanceof Error ? error : new Error(
               String(error)
             )

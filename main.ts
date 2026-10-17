@@ -9,6 +9,7 @@ import {
 } from "obsidian";
 
 import { spawn } from "child_process";
+import type { ChildProcessWithoutNullStreams } from "child_process";
 import * as path from "path";
 import * as fs from "fs";
 
@@ -2729,6 +2730,11 @@ class LogosPlayerView extends ItemView {
     };
 
     previewButton.onclick = async () => {
+      if (this.plugin.isGeneratingSpeech()) {
+        new Notice("Generating, please wait");
+        return;
+      }
+
       statusEl.setText(
         "Generating voice preview..."
       );
@@ -2742,6 +2748,11 @@ class LogosPlayerView extends ItemView {
     };
 
     nextVoiceButton.onclick = async () => {
+      if (this.plugin.isGeneratingSpeech()) {
+        new Notice("Generating, please wait");
+        return;
+      }
+
       const options =
         Array.from(
           voiceSelect.options
@@ -3129,19 +3140,16 @@ export default class LogosPlugin
   private playbackGeneration = 0;
 
   private activeTtsChild:
-    ReturnType<typeof spawn> | null =
+    ChildProcessWithoutNullStreams | null =
       null;
 
   private ttsRequestId = 0;
-
-  private ttsStdoutBuffer = "";
-
-  private ttsStderrBuffer = "";
 
   private pendingTtsRequests =
     new Map<
       number,
       {
+        child: ChildProcessWithoutNullStreams;
         resolve:
           (value: any) => void;
         reject:
@@ -6539,6 +6547,9 @@ export default class LogosPlugin
                 chunks[index + 1],
                 index + 1,
                 generation
+              ).then(
+                outputPath => ({ ok: true as const, outputPath }),
+                error => ({ ok: false as const, error })
               )
             : null;
 
@@ -6560,8 +6571,9 @@ export default class LogosPlugin
         }
 
         if (nextPromise) {
-          currentPath =
-            await nextPromise;
+          const next = await nextPromise;
+          if (!next.ok) throw next.error;
+          currentPath = next.outputPath;
 
           if (!currentPath) {
             return false;
@@ -6638,20 +6650,23 @@ export default class LogosPlugin
       );
   }
 
+  isGeneratingSpeech(): boolean {
+    return this.pendingTtsRequests.size > 0;
+  }
+
   private rejectPendingTtsRequests(
+    child: ChildProcessWithoutNullStreams,
     message: string
   ) {
     const error =
       new Error(message);
 
-    for (
-      const pending
-      of this.pendingTtsRequests.values()
-    ) {
-      pending.reject(error);
+    for (const [id, pending] of this.pendingTtsRequests) {
+      if (pending.child === child) {
+        this.pendingTtsRequests.delete(id);
+        pending.reject(error);
+      }
     }
-
-    this.pendingTtsRequests.clear();
   }
 
   private destroyPersistentTtsWorker(
@@ -6665,17 +6680,8 @@ export default class LogosPlugin
     this.activeTtsChild =
       null;
 
-    this.ttsStdoutBuffer =
-      "";
-
-    this.ttsStderrBuffer =
-      "";
-
-    this.rejectPendingTtsRequests(
-      reason
-    );
-
     if (child) {
+      this.rejectPendingTtsRequests(child, reason);
       try {
         child.kill();
       } catch (error) {
@@ -6691,13 +6697,16 @@ export default class LogosPlugin
     pluginPath: string,
     nodePath: string,
     workerPath: string
-  ): ReturnType<typeof spawn> {
+  ): ChildProcessWithoutNullStreams {
 
     if (
       this.activeTtsChild &&
       this.activeTtsChild.exitCode ===
         null &&
-      !this.activeTtsChild.killed
+      !this.activeTtsChild.killed &&
+      this.activeTtsChild.signalCode === null &&
+      !this.activeTtsChild.stdin.destroyed &&
+      this.activeTtsChild.stdin.writable
     ) {
       return this.activeTtsChild;
     }
@@ -6718,22 +6727,21 @@ export default class LogosPlugin
     this.activeTtsChild =
       child;
 
-    this.ttsStdoutBuffer =
-      "";
-
-    this.ttsStderrBuffer =
-      "";
+    // Output belongs to this child, even after a replacement is spawned.
+    let stdoutBuffer = "";
+    let stderrBuffer = "";
 
     child.stdout.on(
       "data",
       data => {
+        if (this.activeTtsChild !== child) return;
 
-        this.ttsStdoutBuffer +=
+        stdoutBuffer +=
           data.toString();
 
         while (true) {
           const newlineIndex =
-            this.ttsStdoutBuffer
+            stdoutBuffer
               .indexOf("\n");
 
           if (
@@ -6743,15 +6751,15 @@ export default class LogosPlugin
           }
 
           const line =
-            this.ttsStdoutBuffer
+            stdoutBuffer
               .slice(
                 0,
                 newlineIndex
               )
               .trim();
 
-          this.ttsStdoutBuffer =
-            this.ttsStdoutBuffer
+          stdoutBuffer =
+            stdoutBuffer
               .slice(
                 newlineIndex + 1
               );
@@ -6771,7 +6779,7 @@ export default class LogosPlugin
               this.pendingTtsRequests
                 .get(id);
 
-            if (!pending) {
+            if (!pending || pending.child !== child) {
               console.warn(
                 "Logos: Received TTS response for unknown request:",
                 result
@@ -6812,11 +6820,12 @@ export default class LogosPlugin
     child.stderr.on(
       "data",
       data => {
+        if (this.activeTtsChild !== child) return;
 
         const message =
           data.toString();
 
-        this.ttsStderrBuffer +=
+        stderrBuffer +=
           message;
 
         const trimmed =
@@ -6831,69 +6840,36 @@ export default class LogosPlugin
       }
     );
 
-    child.on(
-      "error",
-      error => {
-
-        if (
-          this.activeTtsChild ===
-          child
-        ) {
-          this.activeTtsChild =
-            null;
-        }
-
-        console.error(
-          "Logos persistent TTS process error:",
-          error
-        );
-
-        this.rejectPendingTtsRequests(
-          error.message
-        );
+    const onError = (error: Error) => {
+      if (this.activeTtsChild === child) {
+        console.error("Logos persistent TTS process error:", error);
+        this.destroyPersistentTtsWorker(error.message);
+      } else {
+        this.rejectPendingTtsRequests(child, error.message);
       }
-    );
+    };
 
-    child.on(
-      "close",
-      (code, signal) => {
+    child.on("error", onError);
+    // A closed pipe can fail asynchronously, outside stdin.write's try/catch.
+    child.stdin.on("error", onError);
 
-        if (
-          this.activeTtsChild ===
-          child
-        ) {
-          this.activeTtsChild =
-            null;
-        }
-
-        if (
-          this.pendingTtsRequests.size >
-          0
-        ) {
-          const details =
-            this.ttsStderrBuffer
-              .trim();
-
-          this.rejectPendingTtsRequests(
-            details ||
-            `TTS worker exited with code ${code}, signal ${signal}.`
-          );
-        }
-
-        this.ttsStdoutBuffer =
-          "";
-
-        this.ttsStderrBuffer =
-          "";
+    child.on("close", (code, signal) => {
+      if (this.activeTtsChild === child) {
+        this.activeTtsChild = null;
       }
-    );
+      this.rejectPendingTtsRequests(
+        child,
+        stderrBuffer.trim() ||
+          `TTS worker exited with code ${code}, signal ${signal}.`
+      );
+    });
 
     return child;
   }
 
   private sendPersistentTtsRequest(
     child:
-      ReturnType<typeof spawn>,
+      ChildProcessWithoutNullStreams,
     request: {
       pack: string;
       text: string;
@@ -6909,10 +6885,24 @@ export default class LogosPlugin
     return new Promise(
       (resolve, reject) => {
 
+        if (
+          this.activeTtsChild !== child || child.killed ||
+          child.exitCode !== null || child.signalCode !== null ||
+          child.stdin.destroyed || !child.stdin.writable
+        ) {
+          reject(new Error("TTS worker is not available."));
+          return;
+        }
+
+        const rejectRequest = (error: Error) => {
+          if (this.pendingTtsRequests.delete(id)) reject(error);
+        };
+
         this.pendingTtsRequests
           .set(
             id,
             {
+              child,
               resolve,
               reject
             }
@@ -6925,14 +6915,14 @@ export default class LogosPlugin
               action:
                 "synthesize",
               ...request
-            }) + "\n"
+            }) + "\n",
+            error => {
+              if (error) rejectRequest(error);
+            }
           );
 
         } catch (error) {
-          this.pendingTtsRequests
-            .delete(id);
-
-          reject(
+          rejectRequest(
             error instanceof Error
               ? error
               : new Error(
