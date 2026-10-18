@@ -3154,7 +3154,7 @@ class LogosHelpModal extends Modal {
       details.createEl("summary", { text: "Technical details (kept on this device)" });
       details.createEl("pre", {
         text: this.plugin.lastTtsError.details,
-        attr: { style: "white-space: pre-wrap; overflow-wrap: anywhere; user-select: text;" }
+        cls: "logos-log-output"
       });
     }
 
@@ -3214,6 +3214,7 @@ export default class LogosPlugin
 
   private ttsLogs: string[] = [];
   private ttsLogsTruncated = false;
+  private loggedTtsErrors = new WeakSet<Error>();
 
   private recordTtsLog(message: string) {
     let entry = `[${new Date().toISOString()}] ${message}`;
@@ -3236,6 +3237,7 @@ export default class LogosPlugin
   clearTtsLogs() {
     this.ttsLogs = [];
     this.ttsLogsTruncated = false;
+    this.loggedTtsErrors = new WeakSet<Error>();
   }
 
   private ttsErrorDetails(error: unknown): string {
@@ -3245,7 +3247,7 @@ export default class LogosPlugin
     while (!seen.has(current)) {
       seen.add(current);
       details.push(current instanceof Error ? current.stack || current.message : String(current));
-      if (!current || typeof current !== "object" || !("cause" in current)) break;
+      if (!current || typeof current !== "object" || !("cause" in current) || current.cause == null) break;
       current = current.cause;
     }
     return details.join("\nCaused by: ");
@@ -3257,7 +3259,9 @@ export default class LogosPlugin
 
   private showTtsError(error: unknown) {
     const details = this.ttsErrorDetails(error);
-    this.recordTtsLog(details);
+    if (!(error instanceof Error) || !this.loggedTtsErrors.has(error)) {
+      this.recordTtsLog(details);
+    }
     let summary = "Speech generation failed. Stop and retry, then check Help & troubleshooting.";
     if (/Model files are missing or unreadable/i.test(details)) {
       summary = "Model files are missing or unreadable. Restore the selected voice pack; Help lists the required files.";
@@ -6952,12 +6956,9 @@ export default class LogosPlugin
                 result
               );
             } else {
-              pending.reject(
-                new Error(
-                  result.error ||
-                  "Speech generation failed."
-                )
-              );
+              const error = new Error(result.error || "Speech generation failed.");
+              if (result.error) this.loggedTtsErrors.add(error);
+              pending.reject(error);
             }
 
           } catch (error) {

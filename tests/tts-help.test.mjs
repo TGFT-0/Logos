@@ -18,7 +18,7 @@ function harness(copyFails = false) {
   const copied = [];
   class FileSystemAdapter { getBasePath() { return "/vault"; } }
   class Element {
-    constructor(tag, options = {}) { this.tag = tag; this.textContent = options.text || ""; this.children = []; }
+    constructor(tag, options = {}) { this.options = options; this.tag = tag; this.textContent = options.text || ""; this.children = []; }
     empty() { this.children = []; }
     setText(text) { this.textContent = text; }
     createEl(tag, options) { const el = new Element(tag, options); this.children.push(el); return el; }
@@ -178,3 +178,52 @@ for (const mode of ["short", "long"]) {
     assert.equal(plugin.lastTtsError, previous);
   });
 }
+
+
+test("nullish causes are omitted while meaningful falsy causes are retained", () => {
+  const { plugin } = harness();
+  for (const cause of [undefined, null]) {
+    const error = new Error("Speech failed", { cause });
+    assert.equal(plugin.ttsErrorDetails(error), error.stack);
+  }
+  for (const cause of [0, false, ""]) {
+    assert.ok(plugin.ttsErrorDetails(new Error("Speech failed", { cause })).endsWith("Caused by: " + String(cause)));
+  }
+});
+
+test("a Worker response is logged once but separate identical failures are retained", async () => {
+  const { plugin } = harness();
+  const child = plugin.ensurePersistentTtsWorker("/plugin", "node", "worker");
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const result = plugin.sendPersistentTtsRequest(child, { pack: "kokoro-en", text: "x", output: "/tmp/mock.wav", sid: 0, speed: 1 }).catch(error => error);
+    child.stdout.emit("data", JSON.stringify({ id: plugin.ttsRequestId, success: false, error: "native detail" }) + "\n");
+    const error = await result;
+    plugin.showTtsError(error);
+    assert.equal(plugin.ttsLogs.length, attempt);
+    assert.match(plugin.lastTtsError.details, /native detail/);
+  }
+  plugin.showTtsError(new Error("frontend failure"));
+  assert.equal(plugin.ttsLogs.length, 3);
+  assert.match(plugin.getTtsLogText(), /frontend failure/);
+});
+
+test("clearing logs allows an already received error to be logged when shown", async () => {
+  const { plugin } = harness();
+  const child = plugin.ensurePersistentTtsWorker("/plugin", "node", "worker");
+  const result = plugin.sendPersistentTtsRequest(child, { pack: "kokoro-en", text: "x", output: "/tmp/mock.wav", sid: 0, speed: 1 }).catch(error => error);
+  child.stdout.emit("data", JSON.stringify({ id: plugin.ttsRequestId, success: false, error: "native detail" }) + "\n");
+  const error = await result;
+  plugin.clearTtsLogs();
+  plugin.showTtsError(error);
+  assert.match(plugin.getTtsLogText(), /native detail/);
+});
+
+test("technical details use the shared scrollable text style", () => {
+  const { plugin, modals } = harness();
+  plugin.showTtsError(new Error("long diagnostic\n".repeat(100)));
+  plugin.openTtsHelp();
+  const details = modals[0].contentEl.all().filter(el => el.tag === "pre");
+  assert.equal(details.length, 2);
+  assert.ok(details.every(el => el.options.cls === "logos-log-output"));
+  assert.ok(details.every(el => !el.options.attr?.style));
+});

@@ -37,7 +37,7 @@ var import_child_process = require("child_process");
 var path = __toESM(require("path"), 1);
 var fs = __toESM(require("fs"), 1);
 
-// ../Logos/node_modules/@breezystack/lamejs/dist/lamejs.js
+// node_modules/@breezystack/lamejs/dist/lamejs.js
 var fa = {};
 function Xa(w) {
   return new Int8Array(w);
@@ -11460,7 +11460,7 @@ var LogosHelpModal = class extends import_obsidian.Modal {
       details.createEl("summary", { text: "Technical details (kept on this device)" });
       details.createEl("pre", {
         text: this.plugin.lastTtsError.details,
-        attr: { style: "white-space: pre-wrap; overflow-wrap: anywhere; user-select: text;" }
+        cls: "logos-log-output"
       });
     }
     const logs = contentEl.createEl("details", { cls: "logos-tts-logs" });
@@ -11525,6 +11525,7 @@ var LogosPlugin = class extends import_obsidian.Plugin {
     this.lastTtsError = null;
     this.ttsLogs = [];
     this.ttsLogsTruncated = false;
+    this.loggedTtsErrors = /* @__PURE__ */ new WeakSet();
     this.playbackGeneration = 0;
     this.activeTtsChild = null;
     this.ttsRequestId = 0;
@@ -11583,6 +11584,7 @@ var LogosPlugin = class extends import_obsidian.Plugin {
   clearTtsLogs() {
     this.ttsLogs = [];
     this.ttsLogsTruncated = false;
+    this.loggedTtsErrors = /* @__PURE__ */ new WeakSet();
   }
   ttsErrorDetails(error) {
     const details = [];
@@ -11591,7 +11593,7 @@ var LogosPlugin = class extends import_obsidian.Plugin {
     while (!seen.has(current)) {
       seen.add(current);
       details.push(current instanceof Error ? current.stack || current.message : String(current));
-      if (!current || typeof current !== "object" || !("cause" in current)) break;
+      if (!current || typeof current !== "object" || !("cause" in current) || current.cause == null) break;
       current = current.cause;
     }
     return details.join("\nCaused by: ");
@@ -11601,7 +11603,9 @@ var LogosPlugin = class extends import_obsidian.Plugin {
   }
   showTtsError(error) {
     const details = this.ttsErrorDetails(error);
-    this.recordTtsLog(details);
+    if (!(error instanceof Error) || !this.loggedTtsErrors.has(error)) {
+      this.recordTtsLog(details);
+    }
     let summary = "Speech generation failed. Stop and retry, then check Help & troubleshooting.";
     if (/Model files are missing or unreadable/i.test(details)) {
       summary = "Model files are missing or unreadable. Restore the selected voice pack; Help lists the required files.";
@@ -13614,11 +13618,9 @@ ${result.error}`);
                 result
               );
             } else {
-              pending.reject(
-                new Error(
-                  result.error || "Speech generation failed."
-                )
-              );
+              const error = new Error(result.error || "Speech generation failed.");
+              if (result.error) this.loggedTtsErrors.add(error);
+              pending.reject(error);
             }
           } catch (error) {
             console.error(
