@@ -6659,7 +6659,7 @@ export default class LogosPlugin
   private ttsFailureDetails(child: ChildProcessWithoutNullStreams, error: Error): string {
     const stderr = this.ttsWorkerStderr.get(child);
     return stderr
-      ? `${error.stack || error.message}\nWorker stderr:\n${stderr}`
+      ? `${error.stack || error.message}\nRecent worker stderr (may include earlier warnings):\n${stderr}`
       : error.message;
   }
 
@@ -6718,6 +6718,13 @@ export default class LogosPlugin
       this.activeTtsChild.stdin.writable
     ) {
       return this.activeTtsChild;
+    }
+
+    if (this.activeTtsChild) {
+      const old = this.activeTtsChild;
+      this.destroyPersistentTtsWorker(this.ttsFailureDetails(old, new Error(
+        `Replacing unavailable TTS worker (exit code ${old.exitCode}, signal ${old.signalCode}).`
+      )));
     }
 
     const child =
@@ -6807,6 +6814,11 @@ export default class LogosPlugin
               pending.resolve(
                 result
               );
+              // Keep shared diagnostics while another request still owns this worker.
+              if (![...this.pendingTtsRequests.values()].some(request => request.child === child)) {
+                stderrBuffer = "";
+                this.ttsWorkerStderr.set(child, "");
+              }
             } else {
               pending.reject(
                 new Error(
@@ -6835,6 +6847,11 @@ export default class LogosPlugin
 
         stderrBuffer +=
           message;
+        const limit = 65536;
+        const omitted = "[Earlier worker stderr omitted: 65,536-character limit reached.]\n";
+        if (stderrBuffer.length > limit) {
+          stderrBuffer = omitted + stderrBuffer.slice(-(limit - omitted.length));
+        }
         this.ttsWorkerStderr.set(child, stderrBuffer);
 
         const trimmed =
@@ -6869,8 +6886,9 @@ export default class LogosPlugin
       }
       this.rejectPendingTtsRequests(
         child,
-        stderrBuffer.trim() ||
+        this.ttsFailureDetails(child, new Error(
           `TTS worker exited with code ${code}, signal ${signal}.`
+        ))
       );
       this.ttsWorkerStderr.delete(child);
     });

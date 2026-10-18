@@ -13392,7 +13392,7 @@ ${pdfText}
   ttsFailureDetails(child, error) {
     const stderr = this.ttsWorkerStderr.get(child);
     return stderr ? `${error.stack || error.message}
-Worker stderr:
+Recent worker stderr (may include earlier warnings):
 ${stderr}` : error.message;
   }
   rejectPendingTtsRequests(child, message) {
@@ -13422,6 +13422,12 @@ ${stderr}` : error.message;
   ensurePersistentTtsWorker(pluginPath, nodePath, workerPath) {
     if (this.activeTtsChild && this.activeTtsChild.exitCode === null && !this.activeTtsChild.killed && this.activeTtsChild.signalCode === null && !this.activeTtsChild.stdin.destroyed && this.activeTtsChild.stdin.writable) {
       return this.activeTtsChild;
+    }
+    if (this.activeTtsChild) {
+      const old = this.activeTtsChild;
+      this.destroyPersistentTtsWorker(this.ttsFailureDetails(old, new Error(
+        `Replacing unavailable TTS worker (exit code ${old.exitCode}, signal ${old.signalCode}).`
+      )));
     }
     const child = (0, import_child_process.spawn)(
       nodePath,
@@ -13474,6 +13480,10 @@ ${stderr}` : error.message;
               pending.resolve(
                 result
               );
+              if (![...this.pendingTtsRequests.values()].some((request) => request.child === child)) {
+                stderrBuffer = "";
+                this.ttsWorkerStderr.set(child, "");
+              }
             } else {
               pending.reject(
                 new Error(
@@ -13496,6 +13506,11 @@ ${stderr}` : error.message;
       (data) => {
         const message = data.toString();
         stderrBuffer += message;
+        const limit = 65536;
+        const omitted = "[Earlier worker stderr omitted: 65,536-character limit reached.]\n";
+        if (stderrBuffer.length > limit) {
+          stderrBuffer = omitted + stderrBuffer.slice(-(limit - omitted.length));
+        }
         this.ttsWorkerStderr.set(child, stderrBuffer);
         const trimmed = message.trim();
         if (trimmed) {
@@ -13523,7 +13538,9 @@ ${stderr}` : error.message;
       }
       this.rejectPendingTtsRequests(
         child,
-        stderrBuffer.trim() || `TTS worker exited with code ${code}, signal ${signal}.`
+        this.ttsFailureDetails(child, new Error(
+          `TTS worker exited with code ${code}, signal ${signal}.`
+        ))
       );
       this.ttsWorkerStderr.delete(child);
     });

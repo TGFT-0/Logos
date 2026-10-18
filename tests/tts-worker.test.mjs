@@ -108,7 +108,7 @@ test("worker close rejects only requests owned by that worker", { timeout: 1000 
   const next = worker();
   const nextResult = outcome(plugin.sendPersistentTtsRequest(next, request));
   old.emit("close", 1, null);
-  assert.match((await oldResult).error.message, /exited with code 1/);
+  assert.match((await oldResult).error.message, /Replacing unavailable TTS worker/);
   assert.equal(plugin.pendingTtsRequests.size, 1);
   respond(next);
   assert.equal((await nextResult).value.success, true);
@@ -121,7 +121,9 @@ test("active worker crash rejects its requests and allows a replacement", { time
   const result = outcome(plugin.sendPersistentTtsRequest(child, request));
   child.stderr.emit("data", "Synthesis crashed");
   child.emit("close", 1, null);
-  assert.equal((await result).error.message, "Synthesis crashed");
+  const error = (await result).error.message;
+  assert.match(error, /exited with code 1, signal null/);
+  assert.match(error, /Synthesis crashed/);
   assert.equal(plugin.pendingTtsRequests.size, 0);
   assert.notEqual(worker(), child);
 });
@@ -210,7 +212,7 @@ test("cancelled long-text playback handles an already rejected prefetch", { time
 });
 
 
-test("retired worker retains late stderr without affecting replacement", async () => {
+test("retired worker logs late stderr after immediate retirement without affecting replacement", async () => {
   const { plugin, worker, logs } = harness();
   const old = worker();
   const result = outcome(plugin.sendPersistentTtsRequest(old, request));
@@ -220,7 +222,7 @@ test("retired worker retains late stderr without affecting replacement", async (
   old.stderr.emit("data", "Native initialization failed\n");
   old.stderr.emit("data", "final diagnostic line");
   old.emit("close", 1, null);
-  assert.equal((await result).error.message, "Native initialization failed\nfinal diagnostic line");
+  assert.match((await result).error.message, /Replacing unavailable TTS worker/);
   assert.match(JSON.stringify(logs), /final diagnostic line/);
   assert.equal(plugin.activeTtsChild, next);
   respond(next);
@@ -266,4 +268,73 @@ test("write failure without stderr retains the original Error object and stack",
   const original = new Error("Original write failure");
   child.writeCallback(original);
   assert.equal((await result).error, original);
+});
+
+
+for (const state of ["unwritable", "destroyed"]) {
+  test(`replacing ${state} live worker settles old requests without waiting for close`, async () => {
+    const { plugin, worker } = harness();
+    const old = worker();
+    const oldResult = outcome(plugin.sendPersistentTtsRequest(old, request));
+    if (state === "unwritable") old.stdin.writable = false;
+    else old.stdin.destroyed = true;
+    const next = worker();
+    assert.equal(old.killed, true);
+    assert.equal(plugin.pendingTtsRequests.size, 0);
+    assert.match((await oldResult).error.message, /Replacing unavailable TTS worker/);
+    const result = outcome(plugin.sendPersistentTtsRequest(next, request));
+    respond(next);
+    assert.equal((await result).value.success, true);
+    assert.equal(plugin.isGeneratingSpeech(), false);
+    old.emit("close", 1, null);
+    assert.equal(plugin.activeTtsChild, next);
+  });
+}
+
+test("successful idle worker clears old warning; later crash always reports exit status", async () => {
+  const { plugin, worker, logs } = harness();
+  const child = worker();
+  const first = outcome(plugin.sendPersistentTtsRequest(child, request));
+  child.stderr.emit("data", "old nonfatal warning");
+  respond(child);
+  await first;
+  const second = outcome(plugin.sendPersistentTtsRequest(child, request));
+  child.emit("close", 42, null);
+  const message = (await second).error.message;
+  assert.match(message, /exited with code 42, signal null/);
+  assert.doesNotMatch(message, /old nonfatal warning/);
+  assert.match(JSON.stringify(logs), /old nonfatal warning/);
+});
+
+test("one concurrent success does not erase another request's diagnostic context", async () => {
+  const { plugin, worker } = harness();
+  const child = worker();
+  const first = outcome(plugin.sendPersistentTtsRequest(child, request));
+  const second = outcome(plugin.sendPersistentTtsRequest(child, request));
+  child.stderr.emit("data", "shared native context");
+  respond(child, child.requests[0].id);
+  await first;
+  child.emit("close", null, "SIGABRT");
+  const message = (await second).error.message;
+  assert.match(message, /shared native context/);
+  assert.match(message, /signal SIGABRT/);
+});
+
+test("worker diagnostic tail is bounded and truncation is explicit", async () => {
+  const { plugin, worker } = harness();
+  const child = worker();
+  const result = outcome(plugin.sendPersistentTtsRequest(child, request));
+  child.stderr.emit("data", "old-start" + "x".repeat(100000));
+  child.stderr.emit("data", "y".repeat(10000) + "latest-tail");
+  const tail = plugin.ttsWorkerStderr.get(child);
+  assert.ok(tail.length <= 65536);
+  assert.match(tail, /^\[Earlier worker stderr omitted/);
+  assert.match(tail, /latest-tail$/);
+  assert.doesNotMatch(tail, /old-start/);
+  child.emit("close", 2, null);
+  const message = (await result).error.message;
+  assert.match(message, /exited with code 2/);
+  assert.match(message, /may include earlier warnings/);
+  assert.match(message, /Earlier worker stderr omitted/);
+  assert.match(message, /latest-tail/);
 });
