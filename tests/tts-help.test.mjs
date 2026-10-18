@@ -16,6 +16,7 @@ function harness(copyFails = false) {
   const notices = [];
   const modals = [];
   const copied = [];
+  class FileSystemAdapter { getBasePath() { return "/vault"; } }
   class Element {
     constructor(tag, options = {}) { this.tag = tag; this.textContent = options.text || ""; this.children = []; }
     empty() { this.children = []; }
@@ -37,7 +38,7 @@ function harness(copyFails = false) {
     module, exports: module.exports, Error,
     require(id) {
       if (id === "obsidian") return {
-        Plugin: class {}, ItemView: class {}, Modal: class {
+        Plugin: class {}, ItemView: class {}, FileSystemAdapter, Modal: class {
           constructor() { this.contentEl = new Element("div"); }
           open() { modals.push(this); this.onOpen(); }
         },
@@ -61,7 +62,11 @@ function harness(copyFails = false) {
       }
     }
   });
-  return { plugin: new module.exports.default(), notices, modals, copied };
+  const plugin = new module.exports.default();
+  plugin.app = { vault: { adapter: new FileSystemAdapter(), configDir: ".obsidian" } };
+  plugin.getWorkerEnv = () => ({});
+  plugin.getBundledNodePath = () => "node";
+  return { plugin, notices, modals, copied };
 }
 
 test("error notice is concise while original diagnostics remain accessible through Help", () => {
@@ -152,3 +157,24 @@ test("session logs capture retired native output, process errors and close", () 
   assert.match(plugin.getTtsLogText(), /closed: code 1/);
   assert.equal(plugin.activeTtsChild, replacement);
 });
+
+
+for (const mode of ["short", "long"]) {
+  test(`Stop during ${mode} synthesis does not show an error or overwrite Help`, async () => {
+    const { plugin, notices } = harness();
+    const previous = { summary: "Previous real error", details: "Keep this diagnostic" };
+    plugin.lastTtsError = previous;
+    plugin.splitTextForSpeech = () => ["first", "second"];
+    plugin.synthesizeSpeechChunk = () => plugin.sendPersistentTtsRequest(
+      plugin.ensurePersistentTtsWorker("/plugin", "node", "worker"),
+      { pack: "kokoro-en", text: "hello", output: "/tmp/mock.wav", sid: 0, speed: 1 }
+    );
+    const result = mode === "short" ? plugin.speakWithLocalTts("hello") : plugin.speakLongText("long text");
+    assert.equal(plugin.pendingTtsRequests.size, 1);
+    plugin.stopSpeech();
+    assert.equal(await result, false);
+    assert.equal(plugin.pendingTtsRequests.size, 0);
+    assert.equal(notices.length, 0);
+    assert.equal(plugin.lastTtsError, previous);
+  });
+}

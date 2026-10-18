@@ -224,7 +224,7 @@ function validateModelFiles(config) {
       if (!fs.statSync(file).isFile()) throw new Error("Not a file");
     } catch (error) {
       const details = error && error.stack ? error.stack : String(error);
-      missing.push(`${path.resolve(file)}\n${details}`);
+      missing.push(`${path.resolve(__dirname, file)}\n${details}`);
     }
   }
   if (missing.length) {

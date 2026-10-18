@@ -106,3 +106,12 @@ test("preflight distinguishes directories from missing files", () => {
   assert.match(result.error, /model.onnx/);
   assert.equal(worker.configs.length, 0);
 });
+
+
+test("preflight resolves diagnostics against virtual worker directory, not host cwd", () => {
+  const worker = workerHarness(["phontab"]);
+  const result = worker.request("kokoro-en");
+  const relative = "models/kokoro-en-v0_19/espeak-ng-data/phontab";
+  assert.ok(result.error.includes(path.resolve(worker.workerDir, relative)));
+  assert.ok(!result.error.includes(path.resolve(relative)));
+});
