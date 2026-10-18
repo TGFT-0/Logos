@@ -3145,6 +3145,8 @@ export default class LogosPlugin
 
   private ttsRequestId = 0;
 
+  private ttsWorkerStderr = new WeakMap<ChildProcessWithoutNullStreams, string>();
+
   private pendingTtsRequests =
     new Map<
       number,
@@ -6654,6 +6656,13 @@ export default class LogosPlugin
     return this.pendingTtsRequests.size > 0;
   }
 
+  private ttsFailureDetails(child: ChildProcessWithoutNullStreams, error: Error): string {
+    const stderr = this.ttsWorkerStderr.get(child);
+    return stderr
+      ? `${error.stack || error.message}\nWorker stderr:\n${stderr}`
+      : error.message;
+  }
+
   private rejectPendingTtsRequests(
     child: ChildProcessWithoutNullStreams,
     message: string
@@ -6730,6 +6739,7 @@ export default class LogosPlugin
     // Output belongs to this child, even after a replacement is spawned.
     let stdoutBuffer = "";
     let stderrBuffer = "";
+    this.ttsWorkerStderr.set(child, "");
 
     child.stdout.on(
       "data",
@@ -6820,13 +6830,12 @@ export default class LogosPlugin
     child.stderr.on(
       "data",
       data => {
-        if (this.activeTtsChild !== child) return;
-
         const message =
           data.toString();
 
         stderrBuffer +=
           message;
+        this.ttsWorkerStderr.set(child, stderrBuffer);
 
         const trimmed =
           message.trim();
@@ -6841,11 +6850,12 @@ export default class LogosPlugin
     );
 
     const onError = (error: Error) => {
+      console.error("Logos persistent TTS process error:", error);
+      const details = this.ttsFailureDetails(child, error);
       if (this.activeTtsChild === child) {
-        console.error("Logos persistent TTS process error:", error);
-        this.destroyPersistentTtsWorker(error.message);
+        this.destroyPersistentTtsWorker(details);
       } else {
-        this.rejectPendingTtsRequests(child, error.message);
+        this.rejectPendingTtsRequests(child, details);
       }
     };
 
@@ -6862,6 +6872,7 @@ export default class LogosPlugin
         stderrBuffer.trim() ||
           `TTS worker exited with code ${code}, signal ${signal}.`
       );
+      this.ttsWorkerStderr.delete(child);
     });
 
     return child;
@@ -6895,7 +6906,11 @@ export default class LogosPlugin
         }
 
         const rejectRequest = (error: Error) => {
-          if (this.pendingTtsRequests.delete(id)) reject(error);
+          if (this.pendingTtsRequests.delete(id)) {
+            reject(this.ttsWorkerStderr.get(child)
+              ? new Error(this.ttsFailureDetails(child, error))
+              : error);
+          }
         };
 
         this.pendingTtsRequests

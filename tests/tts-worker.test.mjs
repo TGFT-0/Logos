@@ -14,6 +14,7 @@ const source = transformSync(
 
 function harness() {
   const children = [];
+  const logs = [];
   function spawn() {
     const child = new EventEmitter();
     child.exitCode = null;
@@ -47,13 +48,13 @@ function harness() {
       if (id === "@breezystack/lamejs") return {};
       return require(id);
     },
-    console: { log() {}, warn() {}, error() {} }
+    console: { log() {}, warn(...args) { logs.push(args); }, error(...args) { logs.push(args); } }
   });
   const plugin = new module.exports.default();
   plugin.getWorkerEnv = () => ({});
   return {
     plugin,
-    children,
+    children, logs,
     worker: () => plugin.ensurePersistentTtsWorker("/plugin", "node", "worker.cjs")
   };
 }
@@ -206,4 +207,63 @@ test("cancelled long-text playback handles an already rejected prefetch", { time
     return false;
   };
   assert.equal(await plugin.speakLongText("Long text"), false);
+});
+
+
+test("retired worker retains late stderr without affecting replacement", async () => {
+  const { plugin, worker, logs } = harness();
+  const old = worker();
+  const result = outcome(plugin.sendPersistentTtsRequest(old, request));
+  old.exitCode = 1;
+  const next = worker();
+  const nextResult = outcome(plugin.sendPersistentTtsRequest(next, request));
+  old.stderr.emit("data", "Native initialization failed\n");
+  old.stderr.emit("data", "final diagnostic line");
+  old.emit("close", 1, null);
+  assert.equal((await result).error.message, "Native initialization failed\nfinal diagnostic line");
+  assert.match(JSON.stringify(logs), /final diagnostic line/);
+  assert.equal(plugin.activeTtsChild, next);
+  respond(next);
+  assert.equal((await nextResult).value.success, true);
+});
+
+test("cancelled worker still logs late stderr without changing cancellation", async () => {
+  const { plugin, worker, logs } = harness();
+  const old = worker();
+  const result = outcome(plugin.sendPersistentTtsRequest(old, request));
+  plugin.destroyPersistentTtsWorker("Cancelled");
+  old.stderr.emit("data", "late cancellation diagnostic");
+  old.emit("close", 1, null);
+  assert.equal((await result).error.message, "Cancelled");
+  assert.match(JSON.stringify(logs), /late cancellation diagnostic/);
+});
+
+for (const mode of ["stdin", "process", "callback", "sync"]) {
+  test(`${mode} failure preserves collected stderr and does not settle twice`, async () => {
+    const { plugin, worker, logs } = harness();
+    const child = worker();
+    child.stderr.emit("data", "Native model failure");
+    if (mode === "sync") child.stdin.write = () => { throw new Error("EPIPE"); };
+    const result = outcome(plugin.sendPersistentTtsRequest(child, request));
+    if (mode === "stdin") child.stdin.emit("error", new Error("EPIPE"));
+    if (mode === "process") child.emit("error", new Error("EPIPE"));
+    if (mode === "callback") child.writeCallback(new Error("EPIPE"));
+    const error = (await result).error;
+    assert.match(error.message, /EPIPE/);
+    assert.match(error.message, /Native model failure/);
+    child.stderr.emit("data", "diagnostic after rejection");
+    child.emit("close", 1, null);
+    assert.match(JSON.stringify(logs), /diagnostic after rejection/);
+    assert.equal(plugin.pendingTtsRequests.size, 0);
+  });
+}
+
+
+test("write failure without stderr retains the original Error object and stack", async () => {
+  const { plugin, worker } = harness();
+  const child = worker();
+  const result = outcome(plugin.sendPersistentTtsRequest(child, request));
+  const original = new Error("Original write failure");
+  child.writeCallback(original);
+  assert.equal((await result).error, original);
 });

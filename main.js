@@ -11446,6 +11446,7 @@ var LogosPlugin = class extends import_obsidian.Plugin {
     this.playbackGeneration = 0;
     this.activeTtsChild = null;
     this.ttsRequestId = 0;
+    this.ttsWorkerStderr = /* @__PURE__ */ new WeakMap();
     this.pendingTtsRequests = /* @__PURE__ */ new Map();
     this.chunkPlaybackResolver = null;
     this.currentSpeechChunkFiles = [];
@@ -13388,6 +13389,12 @@ ${pdfText}
   isGeneratingSpeech() {
     return this.pendingTtsRequests.size > 0;
   }
+  ttsFailureDetails(child, error) {
+    const stderr = this.ttsWorkerStderr.get(child);
+    return stderr ? `${error.stack || error.message}
+Worker stderr:
+${stderr}` : error.message;
+  }
   rejectPendingTtsRequests(child, message) {
     const error = new Error(message);
     for (const [id, pending] of this.pendingTtsRequests) {
@@ -13430,6 +13437,7 @@ ${pdfText}
     this.activeTtsChild = child;
     let stdoutBuffer = "";
     let stderrBuffer = "";
+    this.ttsWorkerStderr.set(child, "");
     child.stdout.on(
       "data",
       (data) => {
@@ -13486,9 +13494,9 @@ ${pdfText}
     child.stderr.on(
       "data",
       (data) => {
-        if (this.activeTtsChild !== child) return;
         const message = data.toString();
         stderrBuffer += message;
+        this.ttsWorkerStderr.set(child, stderrBuffer);
         const trimmed = message.trim();
         if (trimmed) {
           console.warn(
@@ -13499,11 +13507,12 @@ ${pdfText}
       }
     );
     const onError = (error) => {
+      console.error("Logos persistent TTS process error:", error);
+      const details = this.ttsFailureDetails(child, error);
       if (this.activeTtsChild === child) {
-        console.error("Logos persistent TTS process error:", error);
-        this.destroyPersistentTtsWorker(error.message);
+        this.destroyPersistentTtsWorker(details);
       } else {
-        this.rejectPendingTtsRequests(child, error.message);
+        this.rejectPendingTtsRequests(child, details);
       }
     };
     child.on("error", onError);
@@ -13516,6 +13525,7 @@ ${pdfText}
         child,
         stderrBuffer.trim() || `TTS worker exited with code ${code}, signal ${signal}.`
       );
+      this.ttsWorkerStderr.delete(child);
     });
     return child;
   }
@@ -13528,7 +13538,9 @@ ${pdfText}
           return;
         }
         const rejectRequest = (error) => {
-          if (this.pendingTtsRequests.delete(id)) reject(error);
+          if (this.pendingTtsRequests.delete(id)) {
+            reject(this.ttsWorkerStderr.get(child) ? new Error(this.ttsFailureDetails(child, error)) : error);
+          }
         };
         this.pendingTtsRequests.set(
           id,
