@@ -222,8 +222,9 @@ function validateModelFiles(config) {
     try {
       fs.accessSync(file, fs.constants.R_OK);
       if (!fs.statSync(file).isFile()) throw new Error("Not a file");
-    } catch {
-      missing.push(path.resolve(file));
+    } catch (error) {
+      const details = error && error.stack ? error.stack : String(error);
+      missing.push(`${path.resolve(file)}\n${details}`);
     }
   }
   if (missing.length) {

@@ -6,7 +6,7 @@ import vm from "node:vm";
 
 const source = readFileSync(new URL("../kokoro-worker-persistent.cjs", import.meta.url), "utf8");
 
-function workerHarness(missing = []) {
+function workerHarness(missing = [], failure = "ENOENT", directory = false) {
   const workerDir = "/vault/" + "中文路径".repeat(30) + "/.obsidian/plugins/logos";
   const responses = [];
   const configs = [];
@@ -15,9 +15,9 @@ function workerHarness(missing = []) {
   const fs = {
     constants: { R_OK: 4 },
     accessSync(file) {
-      if (missing.some(name => file.endsWith(name))) throw new Error("ENOENT");
+      if (missing.some(name => file.endsWith(name))) throw new Error(failure + ": original filesystem diagnostic");
     },
-    statSync: () => ({ isFile: () => true })
+    statSync: () => ({ isFile: () => !directory })
   };
   const sherpa = {
     OfflineTts: class {
@@ -84,5 +84,25 @@ test("missing multilingual model names the requested pack and exact file", () =>
   const result = worker.request("kokoro-multi-fast");
   assert.equal(result.success, false);
   assert.match(result.error, /kokoro-int8-multi-lang-v1_1[/\\]model.int8.onnx/);
+  assert.equal(worker.configs.length, 0);
+});
+
+for (const code of ["ENOENT", "EACCES", "EPERM"]) {
+  test(`preflight retains ${code}, original stack and all failed paths`, () => {
+    const worker = workerHarness(["phontab", "phondata"], code);
+    const result = worker.request("kokoro-en");
+    assert.equal(result.success, false);
+    assert.match(result.error, new RegExp(code + ": original filesystem diagnostic"));
+    assert.match(result.error, /at Object.accessSync/);
+    assert.match(result.error, /phontab/);
+    assert.match(result.error, /phondata/);
+    assert.equal(worker.configs.length, 0);
+  });
+}
+test("preflight distinguishes directories from missing files", () => {
+  const worker = workerHarness([], "ENOENT", true);
+  const result = worker.request("kokoro-en");
+  assert.match(result.error, /Not a file/);
+  assert.match(result.error, /model.onnx/);
   assert.equal(worker.configs.length, 0);
 });

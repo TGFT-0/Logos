@@ -11463,6 +11463,30 @@ var LogosHelpModal = class extends import_obsidian.Modal {
         attr: { style: "white-space: pre-wrap; overflow-wrap: anywhere; user-select: text;" }
       });
     }
+    const logs = contentEl.createEl("details", { cls: "logos-tts-logs" });
+    logs.createEl("summary", { text: "Recent speech logs" });
+    logs.createEl("p", {
+      text: "This session only: up to 100 entries and 100,000 characters. Reloading clears logs. Refresh to include new events. Logs may contain local paths; review before sharing."
+    });
+    const controls = logs.createDiv({ cls: "logos-log-controls" });
+    const output = logs.createEl("pre", { cls: "logos-log-output" });
+    const refresh = () => output.setText(this.plugin.getTtsLogText());
+    controls.createEl("button", { text: "Refresh logs" }).onclick = refresh;
+    controls.createEl("button", { text: "Copy logs" }).onclick = async () => {
+      refresh();
+      try {
+        await navigator.clipboard.writeText(output.textContent || "");
+        new import_obsidian.Notice("Speech logs copied.");
+      } catch (error) {
+        console.error("Logos: Could not copy speech logs:", error);
+        new import_obsidian.Notice("Could not copy logs. Select and copy the text below.");
+      }
+    };
+    controls.createEl("button", { text: "Clear logs" }).onclick = () => {
+      this.plugin.clearTtsLogs();
+      refresh();
+    };
+    refresh();
     const topics = [
       [
         "How do I start reading?",
@@ -11499,6 +11523,8 @@ var LogosPlugin = class extends import_obsidian.Plugin {
   constructor() {
     super(...arguments);
     this.lastTtsError = null;
+    this.ttsLogs = [];
+    this.ttsLogsTruncated = false;
     this.playbackGeneration = 0;
     this.activeTtsChild = null;
     this.ttsRequestId = 0;
@@ -11538,11 +11564,44 @@ var LogosPlugin = class extends import_obsidian.Plugin {
     this.voiceListMode = "all";
     this.audioProcessing = "normalize";
   }
+  recordTtsLog(message) {
+    let entry = `[${(/* @__PURE__ */ new Date()).toISOString()}] ${message}`;
+    if (entry.length > 1e5) {
+      entry = entry.slice(-1e5);
+      this.ttsLogsTruncated = true;
+    }
+    this.ttsLogs.push(entry);
+    while (this.ttsLogs.length > 100 || this.ttsLogs.join("\n").length > 1e5) {
+      this.ttsLogs.shift();
+      this.ttsLogsTruncated = true;
+    }
+  }
+  getTtsLogText() {
+    const prefix = this.ttsLogsTruncated ? "[Older log content omitted: session log limit reached.]\n" : "";
+    return prefix + (this.ttsLogs.join("\n") || "No speech logs in this session.");
+  }
+  clearTtsLogs() {
+    this.ttsLogs = [];
+    this.ttsLogsTruncated = false;
+  }
+  ttsErrorDetails(error) {
+    const details = [];
+    const seen = /* @__PURE__ */ new Set();
+    let current = error;
+    while (!seen.has(current)) {
+      seen.add(current);
+      details.push(current instanceof Error ? current.stack || current.message : String(current));
+      if (!current || typeof current !== "object" || !("cause" in current)) break;
+      current = current.cause;
+    }
+    return details.join("\nCaused by: ");
+  }
   openTtsHelp() {
     new LogosHelpModal(this).open();
   }
   showTtsError(error) {
-    const details = error instanceof Error ? error.message : String(error);
+    const details = this.ttsErrorDetails(error);
+    this.recordTtsLog(details);
     let summary = "Speech generation failed. Stop and retry, then check Help & troubleshooting.";
     if (/Model files are missing or unreadable/i.test(details)) {
       summary = "Model files are missing or unreadable. Restore the selected voice pack; Help lists the required files.";
@@ -13501,6 +13560,17 @@ ${pdfText}
         )
       }
     );
+    child.stderr.on("data", (data) => {
+      this.recordTtsLog(`Worker ${child.pid || "unknown"} stderr:
+${data.toString()}`);
+    });
+    child.on("error", (error) => {
+      this.recordTtsLog(`Worker ${child.pid || "unknown"} error:
+${this.ttsErrorDetails(error)}`);
+    });
+    child.on("close", (code, signal) => {
+      this.recordTtsLog(`Worker ${child.pid || "unknown"} closed: code ${code}, signal ${signal}.`);
+    });
     this.activeTtsChild = child;
     this.ttsStdoutBuffer = "";
     this.ttsStderrBuffer = "";
@@ -13525,6 +13595,10 @@ ${pdfText}
           }
           try {
             const result = JSON.parse(line);
+            if (!result.success && result.error) {
+              this.recordTtsLog(`Worker ${child.pid || "unknown"} response error:
+${result.error}`);
+            }
             const id = Number(result.id);
             const pending = this.pendingTtsRequests.get(id);
             if (!pending) {
